@@ -146,57 +146,71 @@ DIAS_SEMANA_ES = {
 # ---------------------------------------------------------------------------
 # Lógica de simulación recursiva
 # ---------------------------------------------------------------------------
-def simular_producto(
+def simular_escenarios_producto(
     df_producto: pd.DataFrame,
     ajuste_descuento_pct: float,
-    ajuste_competencia_pct: float,
+    escenarios_competencia: dict,
     modelo,
     feature_cols: list,
-) -> pd.DataFrame:
-    """Ejecuta la predicción recursiva día a día para un producto de noviembre.
+) -> dict:
+    """Simula varios escenarios recursivos, agrupando las predicciones por día.
 
     - Recalcula precio_venta, descuento_porcentaje, precio_Competencia y
       ratio_precio según los controles del usuario.
     - Para el día 1 utiliza los lags ya presentes en el dataset (calculados
       desde octubre).
-    - Para el resto de días, desplaza los lags con la predicción del día
-      anterior y recalcula la media móvil de 7 días.
+    - En cada día predice todos los escenarios en una sola llamada al modelo.
     """
-    dias = df_producto.sort_values("fecha").reset_index(drop=True).copy()
+    dias_base = df_producto.sort_values("fecha").reset_index(drop=True)
+    dias_por_escenario = {}
+    lags_por_escenario = {}
+    predicciones_por_escenario = {}
 
-    # 1) Recalcular variables de precio según los controles del usuario
-    dias["precio_venta"] = dias["precio_base"] * (1 - ajuste_descuento_pct / 100.0)
-    dias["descuento_porcentaje"] = (
-        (dias["precio_base"] - dias["precio_venta"]) / dias["precio_base"] * 100.0
-    )
-    dias["precio_Competencia"] = dias["precio_Competencia"] * (
-        1 + ajuste_competencia_pct / 100.0
-    )
-    dias["ratio_precio"] = dias["precio_venta"] / dias["precio_Competencia"]
+    for nombre_escenario, ajuste_competencia_pct in escenarios_competencia.items():
+        dias = dias_base.copy()
+        dias["precio_venta"] = dias["precio_base"] * (
+            1 - ajuste_descuento_pct / 100.0
+        )
+        dias["descuento_porcentaje"] = (
+            (dias["precio_base"] - dias["precio_venta"]) / dias["precio_base"] * 100.0
+        )
+        dias["precio_Competencia"] = dias["precio_Competencia"] * (
+            1 + ajuste_competencia_pct / 100.0
+        )
+        dias["ratio_precio"] = dias["precio_venta"] / dias["precio_Competencia"]
 
-    # 2) Lags iniciales del día 1: tal cual vienen en el dataset (desde octubre)
-    lags_actuales = dias.loc[0, LAG_COLS].astype(float).tolist()
+        dias_por_escenario[nombre_escenario] = dias
+        lags_por_escenario[nombre_escenario] = (
+            dias.loc[0, LAG_COLS].astype(float).tolist()
+        )
+        predicciones_por_escenario[nombre_escenario] = []
 
-    predicciones = []
-    for i in range(len(dias)):
-        if i > 0:
-            # Para día 2+: lag_1 = predicción anterior, se desplaza el resto
-            lags_actuales = [predicciones[-1]] + lags_actuales[:-1]
+    nombres_escenarios = list(dias_por_escenario)
+    for i in range(len(dias_base)):
+        filas = []
+        for nombre_escenario in nombres_escenarios:
+            dias = dias_por_escenario[nombre_escenario]
+            lags_actuales = lags_por_escenario[nombre_escenario]
 
-        for col, val in zip(LAG_COLS, lags_actuales):
-            dias.loc[i, col] = val
-        dias.loc[i, MA_COL] = float(np.mean(lags_actuales))
+            for col, val in zip(LAG_COLS, lags_actuales):
+                dias.loc[i, col] = val
+            dias.loc[i, MA_COL] = float(np.mean(lags_actuales))
+            filas.append(dias.loc[[i], feature_cols])
 
-        fila_x = dias.loc[[i], feature_cols]
-        pred = float(modelo.predict(fila_x)[0])
-        pred = max(pred, 0.0)  # no se permiten unidades negativas
-        predicciones.append(pred)
+        predicciones_dia = modelo.predict(pd.concat(filas, ignore_index=True))
+        for nombre_escenario, pred in zip(nombres_escenarios, predicciones_dia):
+            pred = max(float(pred), 0.0)
+            predicciones_por_escenario[nombre_escenario].append(pred)
+            lags_por_escenario[nombre_escenario] = (
+                [pred] + lags_por_escenario[nombre_escenario][:-1]
+            )
 
-    dias["unidades_predichas"] = predicciones
-    dias["ingresos_predichos"] = dias["unidades_predichas"] * dias["precio_venta"]
-    dias["dia_semana_nombre"] = dias["fecha"].dt.dayofweek.map(DIAS_SEMANA_ES)
+    for nombre_escenario, dias in dias_por_escenario.items():
+        dias["unidades_predichas"] = predicciones_por_escenario[nombre_escenario]
+        dias["ingresos_predichos"] = dias["unidades_predichas"] * dias["precio_venta"]
+        dias["dia_semana_nombre"] = dias["fecha"].dt.dayofweek.map(DIAS_SEMANA_ES)
 
-    return dias
+    return dias_por_escenario
 
 
 def formato_eur(valor: float, decimales: int = 2) -> str:
@@ -274,8 +288,6 @@ with st.sidebar:
         "Competencia -5%": -5,
         "Competencia +5%": 5,
     }
-    ajuste_competencia = mapa_escenarios[escenario_competencia]
-
     st.markdown("---")
     simular = st.button("🚀 Simular Ventas", width="stretch")
 
@@ -292,16 +304,10 @@ if simular:
     with st.spinner("🔄 Calculando predicciones recursivas para los 30 días de noviembre..."):
         df_producto = df_inferencia[df_inferencia["producto_id"] == producto_id]
 
-        resultado_principal = simular_producto(
-            df_producto, ajuste_descuento, ajuste_competencia, modelo, feature_cols
+        resultados_escenarios = simular_escenarios_producto(
+            df_producto, ajuste_descuento, mapa_escenarios, modelo, feature_cols
         )
-
-        # Comparativa de escenarios (mismo descuento, distinta competencia)
-        resultados_escenarios = {}
-        for nombre_esc, pct_esc in mapa_escenarios.items():
-            resultados_escenarios[nombre_esc] = simular_producto(
-                df_producto, ajuste_descuento, pct_esc, modelo, feature_cols
-            )
+        resultado_principal = resultados_escenarios[escenario_competencia]
 
     st.session_state["resultado_principal"] = resultado_principal
     st.session_state["resultados_escenarios"] = resultados_escenarios
